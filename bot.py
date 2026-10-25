@@ -4,6 +4,7 @@ import time
 from typing import Optional, List, Dict, Any
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
@@ -15,12 +16,17 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
+from aiogram.exceptions import TelegramForbiddenError
 
 # ==================== KONFIGURATSIYA ====================
 BOT_TOKEN = "8732171636:AAGc0HkdTpjKOlpVjplNeRpvSZBOZa-53EM"         # BotFather tokeni
 OWNER_ID = 8318241400                    # Owner Telegram ID
 DB_PATH = "anime_bot.db"
+PORT = 8080                               # Render uchun port
+
+# Asosiy kanal sozlamalari (Link va ID)
+CHANNEL_USERNAME = "@kagedub1"        # Kanal yoki kanal botining userneymi (obuna uchun)
+CHANNEL_URL = "https://t.me/@kagedub1"   # Kanalning to'g'ridan-to'g'ri havolasi (linki)
 
 ROLE_CACHE_TTL = 300
 SUB_CACHE_TTL = 45
@@ -83,10 +89,6 @@ class EpisodeDelete(StatesGroup):
     anime_code = State()
     number = State()
 
-class ChannelManage(StatesGroup):
-    add = State()
-    remove = State()
-
 # ==================== DATABASE ====================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -107,13 +109,6 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
                 added_by INTEGER,
-                added_at REAL DEFAULT (strftime('%s','now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                title TEXT,
                 added_at REAL DEFAULT (strftime('%s','now'))
             );
 
@@ -188,30 +183,6 @@ async def get_all_admins() -> List[int]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM admins") as cur:
             return [r[0] for r in await cur.fetchall()]
-
-# ---------- Channels (majburiy obuna) ----------
-async def get_channels() -> List[Dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM channels ORDER BY id") as cur:
-            return [dict(r) for r in await cur.fetchall()]
-
-async def add_channel(username: str, title: str = ""):
-    username = username.lstrip("@").lower()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO channels (username, title) VALUES (?, ?)",
-            (username, title or username)
-        )
-        await db.commit()
-    sub_cache._store.clear()
-
-async def remove_channel(username: str):
-    username = username.lstrip("@").lower()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM channels WHERE username=?", (username,))
-        await db.commit()
-    sub_cache._store.clear()
 
 # ---------- Anime ----------
 async def add_anime(title: str, code: str, genres: str, description: str,
@@ -338,37 +309,25 @@ async def is_staff(uid: int) -> bool:
     return await get_role(uid) in ("owner", "admin")
 
 # ==================== MAJBURIY OBUNA ====================
-async def check_subscriptions(bot: Bot, user_id: int) -> bool:
+async def check_subscription(bot: Bot, user_id: int) -> bool:
     key = f"sub_{user_id}"
     cached = sub_cache.get(key)
     if cached is not None:
         return cached
 
-    channels = await get_channels()
-    if not channels:
-        sub_cache.set(key, True, SUB_CACHE_TTL)
-        return True
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        is_sub = member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+    except Exception:
+        is_sub = False
 
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(chat_id=f"@{ch['username']}", user_id=user_id)
-            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-                sub_cache.set(key, False, SUB_CACHE_NEGATIVE_TTL)
-                return False
-        except Exception:
-            sub_cache.set(key, False, SUB_CACHE_NEGATIVE_TTL)
-            return False
+    ttl = SUB_CACHE_TTL if is_sub else SUB_CACHE_NEGATIVE_TTL
+    sub_cache.set(key, is_sub, ttl)
+    return is_sub
 
-    sub_cache.set(key, True, SUB_CACHE_TTL)
-    return True
-
-def sub_keyboard(channels: List[Dict]) -> InlineKeyboardMarkup:
+def sub_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for ch in channels:
-        builder.row(InlineKeyboardButton(
-            text=f"📢 {ch['title'] or ch['username']}",
-            url=f"https://t.me/{ch['username']}"
-        ))
+    builder.row(InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=CHANNEL_URL))
     builder.row(InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub"))
     return builder.as_markup()
 
@@ -396,8 +355,7 @@ def staff_kb(is_owner: bool = False) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📺 Qism qo‘shish", callback_data="add_ep")
     )
     b.row(
-        InlineKeyboardButton(text="🗑 Qism o‘chirish", callback_data="del_ep"),
-        InlineKeyboardButton(text="📢 Kanallar", callback_data="channels")
+        InlineKeyboardButton(text="🗑 Qism o‘chirish", callback_data="del_ep")
     )
     if is_owner:
         b.row(
@@ -430,12 +388,11 @@ async def cmd_start(message: Message, bot: Bot):
     user = message.from_user
     await add_user(user.id, user.username, user.full_name)
 
-    if not await check_subscriptions(bot, user.id):
-        channels = await get_channels()
+    if not await check_subscription(bot, user.id):
         await message.answer(
             f"<b>Assalomu alaykum, {user.first_name}!</b>\n\n"
-            "Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:",
-            reply_markup=sub_keyboard(channels),
+            "Botdan foydalanish uchun kanalimizga obuna bo‘ling:",
+            reply_markup=sub_keyboard(),
             parse_mode=ParseMode.HTML
         )
         return
@@ -452,22 +409,21 @@ async def cmd_start(message: Message, bot: Bot):
 @router.callback_query(F.data == "check_sub")
 async def cb_check_sub(callback: CallbackQuery, bot: Bot):
     sub_cache.delete(f"sub_{callback.from_user.id}")
-    if await check_subscriptions(bot, callback.from_user.id):
+    if await check_subscription(bot, callback.from_user.id):
         await callback.message.edit_text("✅ <b>Obuna tasdiqlandi!</b>", parse_mode=ParseMode.HTML)
         role = await get_role(callback.from_user.id)
         kb = staff_kb(True) if role == "owner" else (staff_kb(False) if role == "admin" else main_kb())
         await callback.message.answer("Asosiy menyu:", reply_markup=kb)
     else:
-        await callback.answer("Hali barcha kanallarga obuna bo‘lmadingiz!", show_alert=True)
+        await callback.answer("Hali kanalga obuna bo‘lmadingiz!", show_alert=True)
     await callback.answer()
 
 @router.callback_query(F.data == "main")
 async def cb_main(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
-        channels = await get_channels()
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.message.edit_text(
-            "Avval kanallarga obuna bo‘ling:",
-            reply_markup=sub_keyboard(channels)
+            "Avval kanalga obuna bo‘ling:",
+            reply_markup=sub_keyboard()
         )
         await callback.answer()
         return
@@ -493,7 +449,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
 # ---------- QIDIRUV & KO‘RISH ----------
 @router.callback_query(F.data == "search")
 async def cb_search(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.answer("Obuna bo‘ling!", show_alert=True)
         return
     await callback.message.edit_text(
@@ -507,9 +463,8 @@ async def cb_search(callback: CallbackQuery, bot: Bot):
 async def text_handler(message: Message, bot: Bot, state: FSMContext):
     if await state.get_state():
         return
-    if not await check_subscriptions(bot, message.from_user.id):
-        channels = await get_channels()
-        await message.answer("Avval obuna bo‘ling:", reply_markup=sub_keyboard(channels))
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("Avval kanalga obuna bo‘ling:", reply_markup=sub_keyboard())
         return
 
     query = message.text.strip()
@@ -529,7 +484,7 @@ async def text_handler(message: Message, bot: Bot, state: FSMContext):
 
 @router.callback_query(F.data == "random")
 async def cb_random(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.answer("Obuna bo‘ling!", show_alert=True)
         return
     anime = await get_random_anime()
@@ -541,7 +496,7 @@ async def cb_random(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "top")
 async def cb_top(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.answer("Obuna bo‘ling!", show_alert=True)
         return
     items = await get_top_anime()
@@ -557,7 +512,7 @@ async def cb_top(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "newest")
 async def cb_newest(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.answer("Obuna bo‘ling!", show_alert=True)
         return
     items = await get_newest_anime()
@@ -606,7 +561,7 @@ async def show_anime(message: Message, anime: Dict, edit: bool = False):
 
 @router.callback_query(F.data.startswith("a_"))
 async def cb_anime(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.answer("Obuna bo‘ling!", show_alert=True)
         return
     aid = int(callback.data.split("_")[1])
@@ -619,7 +574,7 @@ async def cb_anime(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("ep_"))
 async def cb_episode(callback: CallbackQuery, bot: Bot):
-    if not await check_subscriptions(bot, callback.from_user.id):
+    if not await check_subscription(bot, callback.from_user.id):
         await callback.answer("Obuna bo‘ling!", show_alert=True)
         return
     _, aid, num = callback.data.split("_")
@@ -649,14 +604,12 @@ async def cb_stats(callback: CallbackQuery):
         anime_c = (await (await db.execute("SELECT COUNT(*) FROM anime")).fetchone())[0]
         eps = (await (await db.execute("SELECT COUNT(*) FROM episodes")).fetchone())[0]
         admins = (await (await db.execute("SELECT COUNT(*) FROM admins")).fetchone())[0]
-        chs = (await (await db.execute("SELECT COUNT(*) FROM channels")).fetchone())[0]
     text = (
         f"<b>📊 Statistika</b>\n\n"
         f"👥 Foydalanuvchilar: <b>{users}</b>\n"
         f"🎌 Anime: <b>{anime_c}</b>\n"
         f"📺 Qismlar: <b>{eps}</b>\n"
-        f"🛡 Adminlar: <b>{admins}</b>\n"
-        f"📢 Majburiy kanallar: <b>{chs}</b>"
+        f"🛡 Adminlar: <b>{admins}</b>"
     )
     await callback.message.edit_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
     await callback.answer()
@@ -708,65 +661,6 @@ async def process_id(message: Message, state: FSMContext):
     else:
         await remove_admin(uid)
         await message.answer(f"🚫 <code>{uid}</code> o‘chirildi", parse_mode=ParseMode.HTML)
-    await state.clear()
-
-# ---------- KANALLAR BOSHQARUVI ----------
-@router.callback_query(F.data == "channels")
-async def cb_channels(callback: CallbackQuery):
-    if not await is_staff(callback.from_user.id):
-        await callback.answer("Ruxsat yo‘q", show_alert=True)
-        return
-    chs = await get_channels()
-    text = "<b>📢 Majburiy kanallar</b>\n\n"
-    if chs:
-        text += "\n".join(f"• @{c['username']} — {c['title']}" for c in chs)
-    else:
-        text += "Hozircha yo‘q"
-    b = InlineKeyboardBuilder()
-    b.row(
-        InlineKeyboardButton(text="➕ Qo‘shish", callback_data="ch_add"),
-        InlineKeyboardButton(text="🗑 O‘chirish", callback_data="ch_del")
-    )
-    b.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="main"))
-    await callback.message.edit_text(text, reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
-    await callback.answer()
-
-@router.callback_query(F.data == "ch_add")
-async def cb_ch_add(callback: CallbackQuery, state: FSMContext):
-    if not await is_staff(callback.from_user.id):
-        return
-    await state.set_state(ChannelManage.add)
-    await callback.message.edit_text(
-        "Kanal username ini yuboring (masalan: @KageDub yoki KageDub):",
-        reply_markup=cancel_kb()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data == "ch_del")
-async def cb_ch_del(callback: CallbackQuery, state: FSMContext):
-    if not await is_staff(callback.from_user.id):
-        return
-    await state.set_state(ChannelManage.remove)
-    await callback.message.edit_text("O‘chiriladigan kanal username ini yuboring:", reply_markup=cancel_kb())
-    await callback.answer()
-
-@router.message(ChannelManage.add)
-async def ch_add_process(message: Message, state: FSMContext, bot: Bot):
-    username = message.text.strip().lstrip("@")
-    try:
-        chat = await bot.get_chat(f"@{username}")
-        title = chat.title or username
-        await add_channel(username, title)
-        await message.answer(f"✅ @{username} qo‘shildi")
-    except Exception:
-        await message.answer("❌ Kanal topilmadi yoki bot admin emas")
-    await state.clear()
-
-@router.message(ChannelManage.remove)
-async def ch_del_process(message: Message, state: FSMContext):
-    username = message.text.strip().lstrip("@")
-    await remove_channel(username)
-    await message.answer(f"🗑 @{username} o‘chirildi")
     await state.clear()
 
 # ---------- ANIME QO‘SHISH ----------
@@ -1091,15 +985,32 @@ async def bc_send(callback: CallbackQuery, state: FSMContext, bot: Bot):
     kb = staff_kb(role == "owner")
     await callback.message.answer(f"<b>✅ Muvaffaqiyatli tarqatildi!</b>\nYetib bordi: {success} ta", reply_markup=kb, parse_mode=ParseMode.HTML)
 
+# ==================== KEEP-ALIVE WEB SERVER ====================
+async def handle_ping(request):
+    return web.Response(text="Bot is active!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Keep-Alive web server {PORT}-portda ishga tushdi.")
+
 # ==================== MAIN ====================
 async def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("DIQQAT: BOT_TOKEN va OWNER_ID ni kiriting!")
         return
     await init_db()
+    
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    
+    await start_web_server()
+
     logger.info("Bot ishga tushdi...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
